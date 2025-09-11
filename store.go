@@ -35,26 +35,45 @@ var errNotState = errors.New("not a dedupe-stream state file")
 
 var be = binary.BigEndian
 
+// Options control how a Store is opened.
+type Options struct {
+	// ReadOnly never touches the file: new keys are remembered in memory
+	// only, and a missing file is treated as empty rather than created.
+	ReadOnly bool
+	Now      func() time.Time
+}
+
 // Store is the set of keys seen so far, backed by an append-only file.
 type Store struct {
-	f      *os.File
-	now    func() time.Time
+	opts   Options
+	f      *os.File         // nil for a read-only store with no file yet
 	hashes map[uint64]int64 // key hash -> unix time first seen
 }
 
-// OpenStore opens (creating if needed) the state file at path and loads
-// every recorded key into memory.
-func OpenStore(path string, now func() time.Time) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
+// OpenStore opens the state file at path, creating it unless opts.ReadOnly
+// is set, and loads every recorded key into memory.
+func OpenStore(path string, opts Options) (*Store, error) {
+	if opts.Now == nil {
+		opts.Now = time.Now
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+	s := &Store{opts: opts, hashes: make(map[uint64]int64)}
+	var err error
+	if opts.ReadOnly {
+		s.f, err = os.Open(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return s, nil
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return nil, err
+		}
+		s.f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+	}
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{f: f, now: now, hashes: make(map[uint64]int64)}
 	if err := s.load(); err != nil {
-		f.Close()
+		s.f.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return s, nil
@@ -66,6 +85,9 @@ func (s *Store) load() error {
 	n, err := io.ReadFull(r, hdr[:])
 	switch {
 	case n == 0 && err == io.EOF:
+		if s.opts.ReadOnly {
+			return nil
+		}
 		return s.writeHeader()
 	case err != nil:
 		return errNotState
@@ -124,19 +146,26 @@ func (s *Store) Seen(key []byte, onNew func() error) (bool, error) {
 			return false, err
 		}
 	}
-	ts := s.now().Unix()
-	var rec [hashRecSize]byte
-	be.PutUint64(rec[:8], h)
-	be.PutUint64(rec[8:], uint64(ts))
-	if _, err := s.f.Write(rec[:]); err != nil {
-		return false, fmt.Errorf("recording key: %w", err)
+	ts := s.opts.Now().Unix()
+	if !s.opts.ReadOnly {
+		var rec [hashRecSize]byte
+		be.PutUint64(rec[:8], h)
+		be.PutUint64(rec[8:], uint64(ts))
+		if _, err := s.f.Write(rec[:]); err != nil {
+			return false, fmt.Errorf("recording key: %w", err)
+		}
 	}
 	s.put(h, ts)
 	return false, nil
 }
 
 // Close closes the state file.
-func (s *Store) Close() error { return s.f.Close() }
+func (s *Store) Close() error {
+	if s.f == nil {
+		return nil
+	}
+	return s.f.Close()
+}
 
 // hashKey returns the first 8 bytes of SHA-256(key). With n keys stored, the
 // chance of any two colliding is roughly n²/2⁶⁵: about 1 in 37 million at a

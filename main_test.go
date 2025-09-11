@@ -113,6 +113,11 @@ func TestUsageErrors(t *testing.T) {
 		{"--name", "a", "--file", "b"},
 		{"--bogus"},
 		{"stray-arg"},
+		{"--key", "("},
+		{"--key", "x", "-f", "2"},
+		{"-d", ","},
+		{"-f", "0", "-d", ""},
+		{"--field", "abc"},
 	} {
 		if _, _, code := runApp(t, env, "", args...); code != exitUsage {
 			t.Errorf("%q: exit %d, want %d", args, code, exitUsage)
@@ -128,5 +133,71 @@ func TestHelpAndVersion(t *testing.T) {
 	out, _, code = runApp(t, nil, "", "--version")
 	if code != 0 || !strings.HasPrefix(out, "dedupe-stream ") {
 		t.Errorf("--version: exit %d, output %q", code, out)
+	}
+}
+
+func TestKeyFlagsEndToEnd(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "x.seen")
+	in := "" +
+		"10:00:01 ERROR db: connection refused (attempt 1)\n" +
+		"10:00:02 ERROR db: connection refused (attempt 2)\n" +
+		"10:00:03 WARN cache: miss rate 12%\n" +
+		"10:00:04 error DB: Connection refused (attempt 3)\n"
+	out, errOut, code := runApp(t, nil, in, "--file", file, "--key", `(?:ERROR|WARN|error) (.*)`, "-i", "--strip-numbers")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	want := "" +
+		"10:00:01 ERROR db: connection refused (attempt 1)\n" +
+		"10:00:03 WARN cache: miss rate 12%\n"
+	if out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestFieldFlagEndToEnd(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "x.seen")
+	in := "1,alice,login\n2,bob,login\n3,alice,logout\n"
+	out, _, _ := runApp(t, nil, in, "--file", file, "-f", "2", "-d", ",")
+	if want := "1,alice,login\n2,bob,login\n"; out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestDryRunRecordsNothing(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "x.seen")
+	runApp(t, nil, "a\n", "--file", file)
+	before, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, _, code := runApp(t, nil, "a\nb\nb\nc\n", "--file", file, "--dry-run")
+	if code != 0 || out != "b\nc\n" {
+		t.Errorf("dry run: exit %d, output %q", code, out)
+	}
+	after, _ := os.ReadFile(file)
+	if !bytes.Equal(before, after) {
+		t.Error("--dry-run modified the state file")
+	}
+
+	missing := filepath.Join(t.TempDir(), "never.seen")
+	runApp(t, nil, "a\n", "--file", missing, "--dry-run")
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Errorf("--dry-run created %s", missing)
+	}
+}
+
+func TestInvert(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "x.seen")
+	runApp(t, nil, "a\nb\n", "--file", file)
+	out, _, _ := runApp(t, nil, "a\nc\nc\nb\nd\n", "--file", file, "--invert")
+	if want := "a\nc\nb\n"; out != want {
+		t.Errorf("--invert output = %q, want %q", out, want)
+	}
+	// --invert still records new lines, exactly like a normal run.
+	out, _, _ = runApp(t, nil, "c\nd\ne\n", "--file", file)
+	if want := "e\n"; out != want {
+		t.Errorf("after --invert, output = %q, want %q", out, want)
 	}
 }

@@ -12,7 +12,7 @@ func fixedClock(t time.Time) func() time.Time { return func() time.Time { return
 
 func mustOpen(t *testing.T, path string) *Store {
 	t.Helper()
-	s, err := OpenStore(path, fixedClock(testNow))
+	s, err := OpenStore(path, Options{Now: fixedClock(testNow)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestStoreRejectsForeignFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("2025-09-06 an ordinary log line\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenStore(path, time.Now); !errors.Is(err, errNotState) {
+	if _, err := OpenStore(path, Options{}); !errors.Is(err, errNotState) {
 		t.Fatalf("err = %v, want %v", err, errNotState)
 	}
 }

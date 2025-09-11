@@ -22,12 +22,29 @@ are remembered in a state file, so they stay suppressed in later runs too.
 Output is written line by line, so it works in the middle of a pipeline
 such as "tail -f app.log | dedupe-stream | ...".
 
-Flags:
-      --name NAME   state to use (default "default"), kept in
-                    $XDG_STATE_HOME/dedupe-stream/NAME.seen
-      --file PATH   use the state file at PATH instead of a named state
-  -h, --help        show this help
-      --version     print the version and exit
+State:
+      --name NAME          state to use (default "default"), kept in
+                           $XDG_STATE_HOME/dedupe-stream/NAME.seen
+      --file PATH          use the state file at PATH instead of a named state
+
+Keys (what counts as "the same line"):
+      --key REGEX          compare only the first capture group of REGEX, or
+                           the whole match if it has no groups
+  -f, --field N            compare only field N (counting from 1)
+  -d, --delimiter SEP      split fields on SEP (default: runs of whitespace)
+  -i, --ignore-case        ignore case differences
+      --trim               ignore leading and trailing whitespace
+      --strip-numbers      treat all runs of digits as equal, so
+                           "retry 3" and "retry 7" are the same line
+  Lines that --key does not match, or that have fewer than N fields, are
+  compared whole.
+
+Output:
+      --dry-run            show what would pass, but record nothing
+      --invert             print only the lines that have been seen before
+
+  -h, --help               show this help
+      --version            print the version and exit
 `
 
 const (
@@ -65,8 +82,21 @@ func (a *app) run(args []string) int {
 	var (
 		name        = fs.String("name", "", "")
 		file        = fs.String("file", "", "")
+		keyOpts     keyOptions
+		dryRun      = fs.Bool("dry-run", false, "")
+		invert      = fs.Bool("invert", false, "")
 		showVersion = fs.Bool("version", false, "")
 	)
+	fs.StringVar(&keyOpts.pattern, "key", "", "")
+	fs.IntVar(&keyOpts.field, "f", 0, "")
+	fs.IntVar(&keyOpts.field, "field", 0, "")
+	fs.StringVar(&keyOpts.delim, "d", "", "")
+	fs.StringVar(&keyOpts.delim, "delimiter", "", "")
+	fs.BoolVar(&keyOpts.ignoreCase, "i", false, "")
+	fs.BoolVar(&keyOpts.ignoreCase, "ignore-case", false, "")
+	fs.BoolVar(&keyOpts.trim, "trim", false, "")
+	fs.BoolVar(&keyOpts.stripNumbers, "strip-numbers", false, "")
+
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Fprint(a.stdout, usage)
@@ -81,26 +111,36 @@ func (a *app) run(args []string) int {
 	if fs.NArg() > 0 {
 		return a.usageError(fmt.Sprintf("unexpected argument %q (input is read from stdin)", fs.Arg(0)))
 	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "d" || f.Name == "delimiter" {
+			keyOpts.delimSet = true
+		}
+	})
+	keys, err := newKeyer(keyOpts)
+	if err != nil {
+		return a.usageError(err.Error())
+	}
 
 	path, err := a.statePath(*name, *file)
 	if err != nil {
 		return a.usageError(err.Error())
 	}
-	st, err := OpenStore(path, a.now)
+	st, err := OpenStore(path, Options{ReadOnly: *dryRun, Now: a.now})
 	if err != nil {
 		return a.fail(err)
 	}
 	defer st.Close()
 
-	if err := a.filter(st); err != nil {
+	if err := a.filter(st, keys, *invert); err != nil {
 		return a.fail(err)
 	}
 	return exitOK
 }
 
-// filter copies never-seen lines from stdin to stdout. Each line is written
-// with its own call so output is never held back waiting for more input.
-func (a *app) filter(st *Store) error {
+// filter copies never-seen lines from stdin to stdout, or with invert only
+// the already-seen ones. Each line is written with its own call so output is
+// never held back waiting for more input.
+func (a *app) filter(st *Store, keys *keyer, invert bool) error {
 	r := bufio.NewReaderSize(a.stdin, 64<<10)
 	var buf []byte
 	for {
@@ -111,12 +151,8 @@ func (a *app) filter(st *Store) error {
 				line = append(line, '\n') // unterminated last line
 				buf = line
 			}
-			_, serr := st.Seen(trimEOL(line), func() error {
-				_, err := a.stdout.Write(line)
+			if err := a.filterLine(st, keys.key(trimEOL(line)), line, invert); err != nil {
 				return err
-			})
-			if serr != nil {
-				return serr
 			}
 		}
 		if err == io.EOF {
@@ -126,6 +162,22 @@ func (a *app) filter(st *Store) error {
 			return fmt.Errorf("reading input: %w", err)
 		}
 	}
+}
+
+func (a *app) filterLine(st *Store, key, line []byte, invert bool) error {
+	write := func() error {
+		_, err := a.stdout.Write(line)
+		return err
+	}
+	if !invert {
+		_, err := st.Seen(key, write)
+		return err
+	}
+	seen, err := st.Seen(key, nil)
+	if err != nil || !seen {
+		return err
+	}
+	return write()
 }
 
 // readLine reads one line, including its newline, into buf. Unlike
