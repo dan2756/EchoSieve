@@ -26,6 +26,8 @@ State:
       --name NAME          state to use (default "default"), kept in
                            $XDG_STATE_HOME/dedupe-stream/NAME.seen
       --file PATH          use the state file at PATH instead of a named state
+      --ttl DURATION       forget lines first seen longer ago than this,
+                           e.g. 12h, 7d, 2w (default: remember forever)
 
 Keys (what counts as "the same line"):
       --key REGEX          compare only the first capture group of REGEX, or
@@ -43,8 +45,15 @@ Output:
       --dry-run            show what would pass, but record nothing
       --invert             print only the lines that have been seen before
 
+Managing state (these read no input):
+      --reset              delete the state for --name or --file
+      --stats              show entry count, file size and oldest entry
+      --list               list the named states and their sizes
+
   -h, --help               show this help
       --version            print the version and exit
+
+Exit status is 0 on success, 1 on errors, and 2 for invalid usage.
 `
 
 const (
@@ -83,10 +92,15 @@ func (a *app) run(args []string) int {
 		name        = fs.String("name", "", "")
 		file        = fs.String("file", "", "")
 		keyOpts     keyOptions
+		ttl         ttlFlag
 		dryRun      = fs.Bool("dry-run", false, "")
 		invert      = fs.Bool("invert", false, "")
+		reset       = fs.Bool("reset", false, "")
+		stats       = fs.Bool("stats", false, "")
+		list        = fs.Bool("list", false, "")
 		showVersion = fs.Bool("version", false, "")
 	)
+	fs.Var(&ttl, "ttl", "")
 	fs.StringVar(&keyOpts.pattern, "key", "", "")
 	fs.IntVar(&keyOpts.field, "f", 0, "")
 	fs.IntVar(&keyOpts.field, "field", 0, "")
@@ -121,20 +135,40 @@ func (a *app) run(args []string) int {
 		return a.usageError(err.Error())
 	}
 
+	switch n := countTrue(*reset, *stats, *list); {
+	case n > 1:
+		return a.usageError("use only one of --reset, --stats and --list")
+	case n == 1 && *dryRun && *reset:
+		return a.usageError("--dry-run cannot be combined with --reset")
+	}
+	if *list {
+		if *name != "" || *file != "" {
+			return a.usageError("--list shows every named state; it takes no --name or --file")
+		}
+		return a.exit(a.listStates())
+	}
+
 	path, err := a.statePath(*name, *file)
 	if err != nil {
 		return a.usageError(err.Error())
 	}
-	st, err := OpenStore(path, Options{ReadOnly: *dryRun, Now: a.now})
+	switch {
+	case *reset:
+		return a.exit(a.reset(path))
+	case *stats:
+		label := *name
+		if label == "" && *file == "" {
+			label = defaultName
+		}
+		return a.exit(a.printStats(path, label, time.Duration(ttl)))
+	}
+
+	st, err := OpenStore(path, Options{ReadOnly: *dryRun, TTL: time.Duration(ttl), Now: a.now})
 	if err != nil {
 		return a.fail(err)
 	}
 	defer st.Close()
-
-	if err := a.filter(st, keys, *invert); err != nil {
-		return a.fail(err)
-	}
-	return exitOK
+	return a.exit(a.filter(st, keys, *invert))
 }
 
 // filter copies never-seen lines from stdin to stdout, or with invert only
@@ -217,6 +251,23 @@ func (a *app) statePath(name, file string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, name+stateExt), nil
+}
+
+func countTrue(bs ...bool) int {
+	n := 0
+	for _, b := range bs {
+		if b {
+			n++
+		}
+	}
+	return n
+}
+
+func (a *app) exit(err error) int {
+	if err != nil {
+		return a.fail(err)
+	}
+	return exitOK
 }
 
 func (a *app) usageError(msg string) int {

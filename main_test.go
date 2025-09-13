@@ -201,3 +201,110 @@ func TestInvert(t *testing.T) {
 		t.Errorf("after --invert, output = %q, want %q", out, want)
 	}
 }
+
+func TestTTLFlag(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "x.seen")
+	runAt(t, testNow, nil, "a\nb\n", "--file", file)
+	runAt(t, testNow.Add(6*day), nil, "c\n", "--file", file)
+
+	out, errOut, code := runAt(t, testNow.Add(8*day), nil, "a\nb\nc\nd\n", "--file", file, "--ttl", "7d")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if want := "a\nb\nd\n"; out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestStatsFlag(t *testing.T) {
+	env := map[string]string{"XDG_STATE_HOME": t.TempDir()}
+	runAt(t, testNow, env, "a\nb\nc\n", "--name", "web")
+
+	out, errOut, code := runAt(t, testNow.Add(3*day), env, "", "--name", "web", "--stats")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	for _, want := range []string{"name     web\n", "entries  3\n", "size     64 B\n", "(3d ago)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--stats output missing %q:\n%s", want, out)
+		}
+	}
+
+	out, _, _ = runAt(t, testNow.Add(3*day), env, "", "--name", "web", "--stats", "--ttl", "2d")
+	if !strings.Contains(out, "entries  0\n") || !strings.Contains(out, "expired  3 (ttl 2d") {
+		t.Errorf("--stats --ttl output:\n%s", out)
+	}
+
+	out, _, code = runApp(t, env, "", "--name", "nothing-yet", "--stats")
+	if code != 0 || !strings.Contains(out, "no state file yet") {
+		t.Errorf("--stats on a missing state: exit %d, output %q", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(env["XDG_STATE_HOME"], "dedupe-stream", "nothing-yet.seen")); !os.IsNotExist(err) {
+		t.Error("--stats created a state file")
+	}
+}
+
+func TestListFlag(t *testing.T) {
+	env := map[string]string{"XDG_STATE_HOME": t.TempDir()}
+	out, _, code := runApp(t, env, "", "--list")
+	if code != 0 || out != "" {
+		t.Errorf("--list with no state: exit %d, output %q", code, out)
+	}
+
+	runApp(t, env, "a\nb\n", "--name", "app-errors")
+	runApp(t, env, "a\n")
+	dir := filepath.Join(env["XDG_STATE_HOME"], "dedupe-stream")
+	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("ignore me"), 0o600)
+
+	out, errOut, code := runApp(t, env, "", "--list")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[0], "NAME") ||
+		!strings.HasPrefix(lines[1], "app-errors  2 ") || !strings.HasPrefix(lines[2], "default     1 ") {
+		t.Errorf("--list output:\n%s", out)
+	}
+}
+
+func TestResetFlag(t *testing.T) {
+	env := map[string]string{"XDG_STATE_HOME": t.TempDir()}
+	runApp(t, env, "a\n", "--name", "web")
+	runApp(t, env, "a\n", "--name", "api")
+
+	_, errOut, code := runApp(t, env, "", "--name", "web", "--reset")
+	if code != 0 || !strings.Contains(errOut, "removed") {
+		t.Fatalf("--reset: exit %d, stderr %q", code, errOut)
+	}
+	if out, _, _ := runApp(t, env, "a\n", "--name", "web"); out != "a\n" {
+		t.Errorf("after --reset, output = %q, want %q", out, "a\n")
+	}
+	if out, _, _ := runApp(t, env, "a\n", "--name", "api"); out != "" {
+		t.Errorf("--reset of web affected api: output = %q", out)
+	}
+
+	log := filepath.Join(t.TempDir(), "app.log")
+	os.WriteFile(log, []byte("not a state file\n"), 0o644)
+	if _, _, code := runApp(t, env, "", "--file", log, "--reset"); code != exitError {
+		t.Errorf("--reset on a foreign file: exit %d, want %d", code, exitError)
+	}
+	if _, err := os.Stat(log); err != nil {
+		t.Error("--reset deleted a foreign file")
+	}
+}
+
+func TestActionConflicts(t *testing.T) {
+	env := map[string]string{"HOME": t.TempDir()}
+	for _, args := range [][]string{
+		{"--reset", "--stats"},
+		{"--stats", "--list"},
+		{"--reset", "--dry-run"},
+		{"--list", "--name", "x"},
+		{"--ttl", "soon"},
+		{"--ttl", "0s"},
+	} {
+		if _, _, code := runApp(t, env, "", args...); code != exitUsage {
+			t.Errorf("%q: exit %d, want %d", args, code, exitUsage)
+		}
+	}
+}
