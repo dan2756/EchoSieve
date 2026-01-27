@@ -308,3 +308,25 @@ func TestActionConflicts(t *testing.T) {
 		}
 	}
 }
+
+func TestExactFlag(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "x.seen")
+	out, errOut, code := runApp(t, nil, "a\nb\na\n", "--file", file, "--exact")
+	if code != 0 || out != "a\nb\n" {
+		t.Fatalf("exit %d, output %q, stderr %q", code, out, errOut)
+	}
+	// Later runs need not repeat --exact.
+	if out, _, _ := runApp(t, nil, "a\nc\n", "--file", file); out != "c\n" {
+		t.Errorf("output = %q, want %q", out, "c\n")
+	}
+	out, _, _ = runApp(t, nil, "", "--file", file, "--stats")
+	if !strings.Contains(out, "format   exact keys\n") || !strings.Contains(out, "entries  3\n") {
+		t.Errorf("--stats output:\n%s", out)
+	}
+
+	hashed := filepath.Join(t.TempDir(), "h.seen")
+	runApp(t, nil, "a\n", "--file", hashed)
+	if _, errOut, code := runApp(t, nil, "a\n", "--file", hashed, "--exact"); code != exitError || !strings.Contains(errOut, "--exact") {
+		t.Errorf("--exact on a hash state: exit %d, stderr %q", code, errOut)
+	}
+}

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -21,24 +23,37 @@ import (
 //	9      record kind
 //	10..16 reserved, zero
 //
-// followed by append-only records. A hash record is a fixed 16 bytes: the
-// first 8 bytes of SHA-256(key) and the unix time the key was first seen,
-// both big-endian.
+// followed by append-only records of that kind, all integers big-endian:
+//
+//	kindHash   8-byte key hash (first 8 bytes of SHA-256), 8-byte unix time
+//	kindExact  8-byte unix time, 4-byte key length, the key itself
+//
+// The unix time is when the key was first seen.
 const (
 	magic         = "DDUPSEEN"
 	formatVersion = 1
 	headerSize    = 16
 	hashRecSize   = 16
+	exactRecHead  = 12
+	maxExactKey   = 16 << 20
 
-	kindHash byte = 1
+	kindHash  byte = 1
+	kindExact byte = 2
 )
 
-var errNotState = errors.New("not a dedupe-stream state file")
+var (
+	errNotState  = errors.New("not a dedupe-stream state file")
+	errHashState = errors.New("this state stores hashes, so --exact cannot be used with it; " +
+		"pick another --name, or --reset it first")
+)
 
 var be = binary.BigEndian
 
 // Options control how a Store is opened.
 type Options struct {
+	// Exact stores keys verbatim instead of as 64-bit hashes. It only
+	// matters when the file is created: an existing file keeps its kind.
+	Exact bool
 	// ReadOnly never touches the file: new keys are remembered in memory
 	// only, a missing file is treated as empty, and no lock is taken.
 	ReadOnly bool
@@ -64,7 +79,9 @@ type Store struct {
 	f   *os.File // nil for a read-only store whose file does not exist
 	off int64    // bytes of f read so far; 0 means the header is unread
 
-	hashes  map[uint64]int64 // key hash -> unix time first seen
+	kind    byte
+	hashes  map[uint64]int64 // kindHash: key hash -> unix time first seen
+	exact   map[string]int64 // kindExact: key -> unix time first seen
 	records int              // records read or written, superseded ones included
 }
 
@@ -107,7 +124,10 @@ func (s *Store) open() error {
 		s.f = nil
 	}
 	s.off, s.records = 0, 0
-	s.hashes = make(map[uint64]int64)
+	s.setKind(kindHash)
+	if s.opts.Exact {
+		s.setKind(kindExact)
+	}
 
 	var err error
 	if s.opts.ReadOnly {
@@ -119,6 +139,17 @@ func (s *Store) open() error {
 		s.f, err = os.OpenFile(s.path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	}
 	return err
+}
+
+// setKind switches the record kind and empties the in-memory index.
+func (s *Store) setKind(kind byte) {
+	s.kind = kind
+	s.hashes, s.exact = nil, nil
+	if kind == kindExact {
+		s.exact = make(map[string]int64)
+	} else {
+		s.hashes = make(map[uint64]int64)
+	}
 }
 
 // locked runs fn holding the write lock on a descriptor that refers to the
@@ -180,7 +211,7 @@ func (s *Store) refresh() error {
 		case size == 0 && s.opts.ReadOnly:
 			return nil
 		case size == 0:
-			if _, err := s.f.Write(header(kindHash)); err != nil {
+			if _, err := s.f.Write(header(s.kind)); err != nil {
 				return err
 			}
 			s.off = headerSize
@@ -198,17 +229,52 @@ func (s *Store) refresh() error {
 	}
 
 	r := bufio.NewReaderSize(io.NewSectionReader(s.f, s.off, size-s.off), 64<<10)
-	var rec [hashRecSize]byte
+	var buf []byte
 	for {
-		if _, err := io.ReadFull(r, rec[:]); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return nil // a partial record is completed on a later read
-			}
+		n, err := s.readRecord(r, &buf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil // a partial record is completed on a later read
+		}
+		if err == errCorrupt {
+			return fmt.Errorf("corrupt record at offset %d", s.off)
+		}
+		if err != nil {
 			return err
 		}
-		s.put(be.Uint64(rec[:8]), int64(be.Uint64(rec[8:])))
-		s.off += hashRecSize
+		s.off += int64(n)
 	}
+}
+
+var errCorrupt = errors.New("corrupt record")
+
+// readRecord decodes one record from r into the index and returns its
+// size. buf is scratch space for exact keys.
+func (s *Store) readRecord(r *bufio.Reader, buf *[]byte) (int, error) {
+	if s.kind == kindHash {
+		var rec [hashRecSize]byte
+		if _, err := io.ReadFull(r, rec[:]); err != nil {
+			return 0, err
+		}
+		s.putHash(be.Uint64(rec[:8]), int64(be.Uint64(rec[8:])))
+		return hashRecSize, nil
+	}
+	var head [exactRecHead]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return 0, err
+	}
+	ts, l := int64(be.Uint64(head[:8])), int(be.Uint32(head[8:]))
+	if l > maxExactKey {
+		return 0, errCorrupt
+	}
+	if cap(*buf) < l {
+		*buf = make([]byte, l)
+	}
+	key := (*buf)[:l]
+	if _, err := io.ReadFull(r, key); err != nil {
+		return 0, err
+	}
+	s.putExact(string(key), ts)
+	return exactRecHead + l, nil
 }
 
 func (s *Store) readHeader() error {
@@ -222,8 +288,15 @@ func (s *Store) readHeader() error {
 	if hdr[8] != formatVersion {
 		return fmt.Errorf("unsupported state format version %d", hdr[8])
 	}
-	if hdr[9] != kindHash {
-		return fmt.Errorf("unsupported record kind %d", hdr[9])
+	switch kind := hdr[9]; {
+	case kind == kindHash && s.opts.Exact:
+		return errHashState
+	case kind == kindHash || kind == kindExact:
+		if kind != s.kind {
+			s.setKind(kind)
+		}
+	default:
+		return fmt.Errorf("unsupported record kind %d", kind)
 	}
 	return nil
 }
@@ -236,11 +309,26 @@ func header(kind byte) []byte {
 	return hdr
 }
 
-func (s *Store) put(h uint64, ts int64) {
+func (s *Store) putHash(h uint64, ts int64) {
 	s.records++
 	if old, ok := s.hashes[h]; !ok || ts > old {
 		s.hashes[h] = ts
 	}
+}
+
+func (s *Store) putExact(key string, ts int64) {
+	s.records++
+	if old, ok := s.exact[key]; !ok || ts > old {
+		s.exact[key] = ts
+	}
+}
+
+// times yields the first-seen time of every known key.
+func (s *Store) times() iter.Seq[int64] {
+	if s.kind == kindExact {
+		return maps.Values(s.exact)
+	}
+	return maps.Values(s.hashes)
 }
 
 // cutoff returns the unix time at or before which entries have expired.
@@ -251,15 +339,21 @@ func (s *Store) cutoff() int64 {
 	return s.opts.Now().Add(-s.opts.TTL).Unix()
 }
 
-func (s *Store) has(h uint64) bool {
-	ts, ok := s.hashes[h]
+func (s *Store) has(key []byte) bool {
+	var ts int64
+	var ok bool
+	if s.kind == kindExact {
+		ts, ok = s.exact[string(key)]
+	} else {
+		ts, ok = s.hashes[hashKey(key)]
+	}
 	return ok && ts > s.cutoff()
 }
 
 // live counts the keys that have not expired.
 func (s *Store) live() int {
 	cutoff, n := s.cutoff(), 0
-	for _, ts := range s.hashes {
+	for ts := range s.times() {
 		if ts > cutoff {
 			n++
 		}
@@ -268,23 +362,25 @@ func (s *Store) live() int {
 }
 
 // Len reports the number of distinct keys known, expired ones included.
-func (s *Store) Len() int { return len(s.hashes) }
+func (s *Store) Len() int { return len(s.hashes) + len(s.exact) }
 
 // Seen reports whether key has been seen before. If it has not, Seen calls
 // onNew (when non-nil) and then records the key. The record is written only
 // after onNew succeeds, so a crash or a closed pipe means the line is shown
 // again next time rather than silently lost.
 func (s *Store) Seen(key []byte, onNew func() error) (bool, error) {
-	h := hashKey(key)
-	if s.has(h) {
+	if s.has(key) {
 		return true, nil
+	}
+	if s.kind == kindExact && len(key) > maxExactKey {
+		return false, fmt.Errorf("line too long for --exact (%d bytes, limit %d)", len(key), maxExactKey)
 	}
 	seen := false
 	err := s.locked(func() error {
 		if err := s.refresh(); err != nil {
 			return err
 		}
-		if s.has(h) {
+		if s.has(key) {
 			seen = true
 			return nil
 		}
@@ -293,23 +389,45 @@ func (s *Store) Seen(key []byte, onNew func() error) (bool, error) {
 				return err
 			}
 		}
-		return s.add(h, s.opts.Now().Unix())
+		return s.add(key, s.opts.Now().Unix())
 	})
 	return seen, err
 }
 
-func (s *Store) add(h uint64, ts int64) error {
+func (s *Store) add(key []byte, ts int64) error {
+	var h uint64
+	if s.kind == kindHash {
+		h = hashKey(key)
+	}
 	if !s.opts.ReadOnly {
-		var rec [hashRecSize]byte
-		be.PutUint64(rec[:8], h)
-		be.PutUint64(rec[8:], uint64(ts))
-		if _, err := s.f.Write(rec[:]); err != nil {
+		var rec []byte
+		if s.kind == kindHash {
+			rec = appendHashRecord(nil, h, ts)
+		} else {
+			rec = appendExactRecord(nil, key, ts)
+		}
+		if _, err := s.f.Write(rec); err != nil {
 			return fmt.Errorf("recording key: %w", err)
 		}
-		s.off += hashRecSize
+		s.off += int64(len(rec))
 	}
-	s.put(h, ts)
+	if s.kind == kindHash {
+		s.putHash(h, ts)
+	} else {
+		s.putExact(string(key), ts)
+	}
 	return nil
+}
+
+func appendHashRecord(b []byte, h uint64, ts int64) []byte {
+	b = be.AppendUint64(b, h)
+	return be.AppendUint64(b, uint64(ts))
+}
+
+func appendExactRecord[K string | []byte](b []byte, key K, ts int64) []byte {
+	b = be.AppendUint64(b, uint64(ts))
+	b = be.AppendUint32(b, uint32(len(key)))
+	return append(b, key...)
 }
 
 // compact rewrites the file with only the live entries, dropping expired
@@ -317,16 +435,24 @@ func (s *Store) add(h uint64, ts int64) error {
 // lock held on the new file.
 func (s *Store) compact() error {
 	type entry struct {
-		h  uint64
-		ts int64
+		ts  int64
+		h   uint64
+		key string
 	}
 	cutoff := s.cutoff()
-	keep := make([]entry, 0, len(s.hashes))
+	keep := make([]entry, 0, s.Len())
 	for h, ts := range s.hashes {
 		if ts > cutoff {
-			keep = append(keep, entry{h, ts})
+			keep = append(keep, entry{ts: ts, h: h})
 		} else {
 			delete(s.hashes, h)
+		}
+	}
+	for key, ts := range s.exact {
+		if ts > cutoff {
+			keep = append(keep, entry{ts: ts, key: key})
+		} else {
+			delete(s.exact, key)
 		}
 	}
 	sort.Slice(keep, func(i, j int) bool { return keep[i].ts < keep[j].ts })
@@ -349,12 +475,17 @@ func (s *Store) compact() error {
 		return err
 	}
 	w := bufio.NewWriterSize(tmp, 64<<10)
-	w.Write(header(kindHash))
-	var rec [hashRecSize]byte
+	w.Write(header(s.kind))
+	size := int64(headerSize)
+	var rec []byte
 	for _, e := range keep {
-		be.PutUint64(rec[:8], e.h)
-		be.PutUint64(rec[8:], uint64(e.ts))
-		w.Write(rec[:])
+		if s.kind == kindHash {
+			rec = appendHashRecord(rec[:0], e.h, e.ts)
+		} else {
+			rec = appendExactRecord(rec[:0], e.key, e.ts)
+		}
+		w.Write(rec)
+		size += int64(len(rec))
 	}
 	if err := w.Flush(); err != nil {
 		return err
@@ -369,7 +500,7 @@ func (s *Store) compact() error {
 
 	s.f.Close() // drops the old lock; waiters see the file was replaced
 	s.f = tmp
-	s.off = headerSize + int64(len(keep))*hashRecSize
+	s.off = size
 	s.records = len(keep)
 	done = true
 	return nil
@@ -387,6 +518,7 @@ func syncDir(dir string) {
 // Stats describes a state file.
 type Stats struct {
 	Exists  bool
+	Exact   bool
 	Size    int64
 	Records int // records in the file, superseded ones included
 	Entries int // distinct live keys
@@ -405,10 +537,10 @@ func (s *Store) Stats() (Stats, error) {
 	if err != nil {
 		return st, err
 	}
-	st.Exists, st.Size, st.Records = true, fi.Size(), s.records
+	st.Exists, st.Exact, st.Size, st.Records = true, s.kind == kindExact, fi.Size(), s.records
 	cutoff := s.cutoff()
 	var oldest, newest int64
-	for _, ts := range s.hashes {
+	for ts := range s.times() {
 		if ts <= cutoff {
 			st.Expired++
 			continue
@@ -475,7 +607,7 @@ func Reset(path string) (bool, error) {
 
 // hashKey returns the first 8 bytes of SHA-256(key). With n keys stored, the
 // chance of any two colliding is roughly n²/2⁶⁵: about 1 in 37 million at a
-// million keys.
+// million keys. Use --exact if even that is too much.
 func hashKey(key []byte) uint64 {
 	sum := sha256.Sum256(key)
 	return be.Uint64(sum[:8])

@@ -28,6 +28,8 @@ State:
       --file PATH          use the state file at PATH instead of a named state
       --ttl DURATION       forget lines first seen longer ago than this,
                            e.g. 12h, 7d, 2w (default: remember forever)
+      --exact              store whole keys instead of 64-bit hashes, ruling
+                           out collisions at the cost of space (new state only)
 
 Keys (what counts as "the same line"):
       --key REGEX          compare only the first capture group of REGEX, or
@@ -93,6 +95,7 @@ func (a *app) run(args []string) int {
 		file        = fs.String("file", "", "")
 		keyOpts     keyOptions
 		ttl         ttlFlag
+		exact       = fs.Bool("exact", false, "")
 		dryRun      = fs.Bool("dry-run", false, "")
 		invert      = fs.Bool("invert", false, "")
 		reset       = fs.Bool("reset", false, "")
@@ -163,7 +166,12 @@ func (a *app) run(args []string) int {
 		return a.exit(a.printStats(path, label, time.Duration(ttl)))
 	}
 
-	st, err := OpenStore(path, Options{ReadOnly: *dryRun, TTL: time.Duration(ttl), Now: a.now})
+	st, err := OpenStore(path, Options{
+		Exact:    *exact,
+		ReadOnly: *dryRun,
+		TTL:      time.Duration(ttl),
+		Now:      a.now,
+	})
 	if err != nil {
 		return a.fail(err)
 	}

@@ -23,6 +23,7 @@ tail -f app.log | dedupe-stream --name app-errors
 | `--name NAME` | state to use (default `default`) |
 | `--file PATH` | use the state file at `PATH` instead of a named state |
 | `--ttl DURATION` | forget lines first seen longer ago than this (`12h`, `7d`, `2w`, `1d12h`) |
+| `--exact` | store whole keys instead of 64-bit hashes: no collisions, more space |
 | `--key REGEX` | compare only the first capture group of `REGEX` (or the whole match) |
 | `-f`, `--field N` | compare only field `N`, counting from 1 |
 | `-d`, `--delimiter SEP` | field separator for `--field` (default: runs of whitespace) |
@@ -46,7 +47,8 @@ one line again; it never silently swallows one.
 
 State for `--name NAME` lives in `$XDG_STATE_HOME/dedupe-stream/NAME.seen`
 (default `~/.local/state/dedupe-stream/NAME.seen`). Each seen line costs 16
-bytes on disk: an 8-byte hash and the time it was first seen.
+bytes on disk, an 8-byte hash and the time it was first seen, and is loaded
+into memory on startup.
 
 ## Choosing a key
 
@@ -93,6 +95,27 @@ seen, so a line that keeps recurring passes again once per TTL. When a run
 with `--ttl` starts and the state file holds expired entries, the file is
 compacted (rewritten without them) before any input is read. Without `--ttl`
 nothing ever expires, whatever earlier runs used.
+
+## Hashes, collisions and `--exact`
+
+By default each key is stored as the first 8 bytes of its SHA-256. That keeps
+records small and fixed-size, but two different lines could in principle get
+the same hash, and then the second would be wrongly dropped. With `n`
+distinct lines stored, the chance that *any* pair collides is about
+`n² / 2⁶⁵`:
+
+| lines stored | chance of any collision |
+| --- | --- |
+| 100,000 | about 1 in 3.7 billion |
+| 1,000,000 | about 1 in 37 million |
+| 100,000,000 | about 1 in 3,700 |
+
+If that is still too much, `--exact` stores every key verbatim (12 bytes of
+overhead plus the key) and compares keys byte for byte. It costs more disk
+and memory, especially for long lines, so it pairs well with `--key` or
+`--field`. The record format is chosen when a state file is created: an
+`--exact` state stays exact without repeating the flag, and `--exact` on an
+existing hash state is refused (pick another `--name` or `--reset` first).
 
 ## Managing state
 

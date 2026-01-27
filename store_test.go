@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -317,5 +318,74 @@ func TestStats(t *testing.T) {
 	}
 	if st.Size != headerSize+3*hashRecSize {
 		t.Errorf("size = %d", st.Size)
+	}
+}
+
+func TestExactStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	s := openWith(t, path, Options{Exact: true, Now: fixedClock(testNow)})
+	keys := []string{"disk full on /var", "", "dup", "dup", "naïve ünïcode"}
+	for _, k := range keys {
+		seen(t, s, k)
+	}
+	s.Close()
+
+	want := int64(headerSize)
+	for _, k := range []string{"disk full on /var", "", "dup", "naïve ünïcode"} {
+		want += exactRecHead + int64(len(k))
+	}
+	if got := fileSize(t, path); got != want {
+		t.Errorf("size = %d, want %d", got, want)
+	}
+	data, _ := os.ReadFile(path)
+	if !bytes.Contains(data, []byte("disk full on /var")) {
+		t.Error("exact record does not contain the key itself")
+	}
+
+	// Reopening without Exact keeps using the file's own kind.
+	s = mustOpen(t, path)
+	for _, k := range keys {
+		if !seen(t, s, k) {
+			t.Errorf("%q lost across reopen", k)
+		}
+	}
+	if seen(t, s, "disk full on /home") {
+		t.Error("unexpected key")
+	}
+	st, _ := s.Stats()
+	if !st.Exact || st.Entries != 5 {
+		t.Errorf("stats = %+v, want exact with 5 entries", st)
+	}
+}
+
+func TestExactRefusesHashState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	s := mustOpen(t, path)
+	seen(t, s, "x")
+	s.Close()
+	if _, err := OpenStore(path, Options{Exact: true}); !errors.Is(err, errHashState) {
+		t.Fatalf("err = %v, want %v", err, errHashState)
+	}
+}
+
+func TestExactCompaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	c := &clock{t: testNow}
+	s := openWith(t, path, Options{Exact: true, Now: c.now})
+	seen(t, s, "old")
+	c.advance(3 * day)
+	seen(t, s, "new")
+	s.Close()
+
+	s = openWith(t, path, Options{TTL: 2 * day, Now: c.now})
+	if got, want := fileSize(t, path), int64(headerSize+exactRecHead+len("new")); got != want {
+		t.Errorf("size after compaction = %d, want %d", got, want)
+	}
+	if !seen(t, s, "new") || seen(t, s, "old") {
+		t.Error("compaction kept the wrong keys")
+	}
+	st, _ := s.Stats()
+	if !st.Exact {
+		t.Error("compaction changed the record kind")
 	}
 }

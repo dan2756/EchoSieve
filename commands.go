@@ -43,7 +43,11 @@ func (a *app) printStats(path, name string, ttl time.Duration) error {
 		fmt.Fprintf(w, "entries\t0 (no state file yet)\n")
 		return w.Flush()
 	}
-	fmt.Fprintf(w, "format\tsha256/64 hashes\n")
+	if s.Exact {
+		fmt.Fprintf(w, "format\texact keys\n")
+	} else {
+		fmt.Fprintf(w, "format\tsha256/64 hashes\n")
+	}
 	fmt.Fprintf(w, "entries\t%d\n", s.Entries)
 	if ttl > 0 {
 		fmt.Fprintf(w, "expired\t%d (ttl %s)\n", s.Expired, formatTTL(ttl))
