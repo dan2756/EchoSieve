@@ -283,15 +283,36 @@ func TestReset(t *testing.T) {
 }
 
 func TestResetRefusesForeignFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "app.log")
-	if err := os.WriteFile(path, []byte("precious log data\n"), 0o644); err != nil {
-		t.Fatal(err)
+	dir := t.TempDir()
+	for name, data := range map[string]string{
+		"app.log":   "precious log data\n",
+		"empty.log": "",              // e.g. a log that was just rotated
+		"short.txt": magic[:2],       // a prefix of the magic is not enough
+		"almost":    magic[:7] + "X", // nor is a near miss
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Reset(path); !errors.Is(err, errNotState) {
+			t.Errorf("%s: err = %v, want %v", name, err, errNotState)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s: Reset deleted a file that was not a state file", name)
+		}
 	}
-	if _, err := Reset(path); !errors.Is(err, errNotState) {
-		t.Fatalf("err = %v, want %v", err, errNotState)
+
+	// A device is never a state file. Going through a link keeps the test
+	// harmless: at worst the link itself would be removed.
+	link := filepath.Join(dir, "null")
+	if err := os.Symlink(os.DevNull, link); err != nil {
+		t.Skip(err)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatal("Reset deleted a file that was not a state file")
+	if _, err := Reset(link); !errors.Is(err, errNotState) {
+		t.Errorf("device: err = %v, want %v", err, errNotState)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Error("Reset deleted a device")
 	}
 }
 
@@ -387,5 +408,132 @@ func TestExactCompaction(t *testing.T) {
 	st, _ := s.Stats()
 	if !st.Exact {
 		t.Error("compaction changed the record kind")
+	}
+}
+
+// appendBytes simulates a writer that died part-way through an append.
+func appendBytes(t *testing.T, path string, b []byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write(b); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTornRecordIsTruncated(t *testing.T) {
+	for _, exact := range []bool{false, true} {
+		name := "hash"
+		if exact {
+			name = "exact"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "s.seen")
+			opts := Options{Exact: exact, Now: fixedClock(testNow)}
+			s := openWith(t, path, opts)
+			seen(t, s, "a")
+			seen(t, s, "b")
+			s.Close()
+			intact := fileSize(t, path)
+
+			// Half of a record for a long key.
+			var torn []byte
+			if exact {
+				torn = appendExactRecord(nil, "a key that was never fully written", testNow.Unix())
+			} else {
+				torn = appendHashRecord(nil, hashKey([]byte("never written")), testNow.Unix())
+			}
+			appendBytes(t, path, torn[:len(torn)/2])
+
+			s = openWith(t, path, opts)
+			if got := fileSize(t, path); got != intact {
+				t.Errorf("size after reopen = %d, want %d (torn record not removed)", got, intact)
+			}
+			if seen(t, s, "c") {
+				t.Fatal("c seen on first sight")
+			}
+			s.Close()
+
+			s = openWith(t, path, opts)
+			for _, k := range []string{"a", "b", "c"} {
+				if !seen(t, s, k) {
+					t.Errorf("%q lost after recovering from a torn record", k)
+				}
+			}
+			if s.Len() != 3 {
+				t.Errorf("Len = %d, want 3", s.Len())
+			}
+		})
+	}
+}
+
+func TestReadOnlyKeepsKeysAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	c := &clock{t: testNow}
+	ro := openWith(t, path, Options{ReadOnly: true, Now: c.now})
+	if seen(t, ro, "dup-1") {
+		t.Fatal("dup-1 seen on first sight")
+	}
+
+	// Another process creates the file. The next new key makes the
+	// read-only store switch to it, and it must not forget dup-1.
+	w := openWith(t, path, c.opts(0))
+	seen(t, w, "unrelated")
+	w.Close()
+	if seen(t, ro, "other-1") {
+		t.Fatal("other-1 seen on first sight")
+	}
+	if !seen(t, ro, "dup-1") {
+		t.Error("dup-1 forgotten when the state file was created")
+	}
+	if !seen(t, ro, "unrelated") {
+		t.Error("key recorded by another process not picked up")
+	}
+
+	// The same when another process compacts the file.
+	c.advance(10 * day)
+	if seen(t, ro, "dup-2") {
+		t.Fatal("dup-2 seen on first sight")
+	}
+	w = openWith(t, path, c.opts(7*day))
+	w.Close()
+	if seen(t, ro, "other-2") {
+		t.Fatal("other-2 seen on first sight")
+	}
+	if !seen(t, ro, "dup-2") {
+		t.Error("dup-2 forgotten when the state file was compacted")
+	}
+}
+
+func TestExactStoreRejectsLongKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	s := openWith(t, path, Options{Exact: true, Now: fixedClock(testNow)})
+	called := false
+	_, err := s.Seen(make([]byte, maxExactKey+1), func() error { called = true; return nil })
+	if !errors.Is(err, errKeyTooLong) {
+		t.Fatalf("err = %v, want %v", err, errKeyTooLong)
+	}
+	if called || fileSize(t, path) != headerSize {
+		t.Error("an oversized key was passed on or recorded by the store")
+	}
+}
+
+func TestReadOnlyLeavesPartialRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	s := mustOpen(t, path)
+	seen(t, s, "a")
+	s.Close()
+	appendBytes(t, path, []byte{1, 2, 3})
+	size := fileSize(t, path)
+
+	ro := openWith(t, path, Options{ReadOnly: true})
+	if !seen(t, ro, "a") {
+		t.Error("a not seen")
+	}
+	if got := fileSize(t, path); got != size {
+		t.Errorf("read-only store changed the file size from %d to %d", size, got)
 	}
 }

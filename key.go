@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"unicode"
+	"unicode/utf8"
 )
 
 // keyer turns an input line into the key used for deduplication. By default
@@ -22,6 +24,7 @@ type keyer struct {
 type keyOptions struct {
 	pattern      string
 	field        int
+	fieldSet     bool
 	delim        string
 	delimSet     bool
 	ignoreCase   bool
@@ -46,7 +49,7 @@ func newKeyer(o keyOptions) (*keyer, error) {
 		}
 		k.re = re
 	}
-	if o.field < 0 {
+	if o.field < 0 || (o.fieldSet && o.field == 0) {
 		return nil, fmt.Errorf("invalid --field %d: fields are numbered from 1", o.field)
 	}
 	if o.delimSet {
@@ -76,7 +79,7 @@ func (k *keyer) key(line []byte) []byte {
 		key = bytes.TrimSpace(key)
 	}
 	if k.ignoreCase {
-		key = bytes.ToLower(key)
+		key = toLower(key)
 	}
 	if k.stripNumbers {
 		key = collapseDigits(key)
@@ -120,6 +123,26 @@ func (k *keyer) pickField(line []byte) []byte {
 		}
 		rest = rest[j+len(k.delim):]
 	}
+}
+
+// toLower is bytes.ToLower, except that bytes which are not valid UTF-8 are
+// kept as they are rather than all turned into U+FFFD, so lines in another
+// encoding (say, Latin-1 "Jos\xe9" and "Jos\xe8") do not become equal.
+func toLower(b []byte) []byte {
+	if utf8.Valid(b) {
+		return bytes.ToLower(b)
+	}
+	out := make([]byte, 0, len(b))
+	for len(b) > 0 {
+		r, n := utf8.DecodeRune(b)
+		if r == utf8.RuneError && n == 1 {
+			out = append(out, b[0])
+		} else {
+			out = utf8.AppendRune(out, unicode.ToLower(r))
+		}
+		b = b[n:]
+	}
+	return out
 }
 
 // collapseDigits replaces every run of ASCII digits with a single "0", so

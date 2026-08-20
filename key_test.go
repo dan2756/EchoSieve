@@ -27,6 +27,7 @@ func TestKeyExtraction(t *testing.T) {
 		{"field delimiter out of range", keyOptions{field: 4, delim: ",", delimSet: true}, "1,2,3", "1,2,3"},
 
 		{"ignore case", keyOptions{ignoreCase: true}, "Disk FULL on /Var", "disk full on /var"},
+		{"ignore case keeps invalid UTF-8", keyOptions{ignoreCase: true}, "M\xfcLLER Ü \xff", "m\xfcller ü \xff"},
 		{"trim", keyOptions{trim: true}, " \t padded \t", "padded"},
 		{"strip numbers", keyOptions{stripNumbers: true}, "retry 3 of 10 after 250ms", "retry 0 of 0 after 0ms"},
 		{"strip numbers keeps zero", keyOptions{stripNumbers: true}, "0", "0"},
@@ -53,6 +54,7 @@ func TestKeyOptionErrors(t *testing.T) {
 		"bad regex":       {pattern: `(`},
 		"key and field":   {pattern: `x`, field: 1},
 		"negative field":  {field: -1},
+		"zero field":      {field: 0, fieldSet: true},
 		"delimiter alone": {delim: ",", delimSet: true},
 		"empty delimiter": {field: 1, delim: "", delimSet: true},
 	} {
@@ -78,7 +80,13 @@ func TestNormalizationSameKeys(t *testing.T) {
 			t.Errorf("%q -> %q and %q -> %q should match", p[0], a, p[1], b)
 		}
 	}
-	if a, b := k.key([]byte("retry 3")), k.key([]byte("retry")); string(a) == string(b) {
-		t.Errorf("%q and %q should differ", "retry 3", "retry")
+	for _, p := range [][2]string{
+		{"retry 3", "retry"},
+		{"Jos\xe9", "Jos\xe8"}, // Latin-1 é and è
+		{"M\xfcller", "M\xe4ller"},
+	} {
+		if a, b := k.key([]byte(p[0])), k.key([]byte(p[1])); string(a) == string(b) {
+			t.Errorf("%q and %q should differ", p[0], p[1])
+		}
 	}
 }

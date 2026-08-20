@@ -45,6 +45,7 @@ var (
 	errNotState  = errors.New("not a dedupe-stream state file")
 	errHashState = errors.New("this state stores hashes, so --exact cannot be used with it; " +
 		"pick another --name, or --reset it first")
+	errKeyTooLong = errors.New("key too long for an --exact state")
 )
 
 var be = binary.BigEndian
@@ -118,15 +119,20 @@ func OpenStore(path string, opts Options) (*Store, error) {
 }
 
 // open (re)opens the file at s.path, forgetting everything read so far.
+// A read-only store keeps its index instead: the keys it would have
+// recorded exist only in memory, and forgetting them would let a line
+// pass twice in one run.
 func (s *Store) open() error {
 	if s.f != nil {
 		s.f.Close()
 		s.f = nil
 	}
 	s.off, s.records = 0, 0
-	s.setKind(kindHash)
-	if s.opts.Exact {
-		s.setKind(kindExact)
+	if !s.opts.ReadOnly || (s.hashes == nil && s.exact == nil) {
+		s.setKind(kindHash)
+		if s.opts.Exact {
+			s.setKind(kindExact)
+		}
 	}
 
 	var err error
@@ -233,7 +239,7 @@ func (s *Store) refresh() error {
 	for {
 		n, err := s.readRecord(r, &buf)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return nil // a partial record is completed on a later read
+			break
 		}
 		if err == errCorrupt {
 			return fmt.Errorf("corrupt record at offset %d", s.off)
@@ -243,6 +249,17 @@ func (s *Store) refresh() error {
 		}
 		s.off += int64(n)
 	}
+	if s.off < size && !s.opts.ReadOnly {
+		// Writers append whole records while holding the lock, so a partial
+		// record seen under the lock was left by one that died mid-append
+		// (kill -9, power loss, a full disk). Cut it off: appending after
+		// it would misalign every record that follows. Read-only stores
+		// just skip it, since it may be an append still in progress.
+		if err := s.f.Truncate(s.off); err != nil {
+			return fmt.Errorf("removing torn record: %w", err)
+		}
+	}
+	return nil
 }
 
 var errCorrupt = errors.New("corrupt record")
@@ -373,7 +390,7 @@ func (s *Store) Seen(key []byte, onNew func() error) (bool, error) {
 		return true, nil
 	}
 	if s.kind == kindExact && len(key) > maxExactKey {
-		return false, fmt.Errorf("line too long for --exact (%d bytes, limit %d)", len(key), maxExactKey)
+		return false, fmt.Errorf("%w (%d bytes, limit %d)", errKeyTooLong, len(key), maxExactKey)
 	}
 	seen := false
 	err := s.locked(func() error {
@@ -570,9 +587,14 @@ func (s *Store) Close() error {
 // Reset deletes the state file at path, reporting whether there was one.
 // It waits for the lock so it never removes the file in the middle of
 // another process's append, and it refuses to delete anything that is not
-// a state file.
+// a state file: a device or FIFO is not even opened, and a regular file
+// (an empty one included) must start with the magic.
 func Reset(path string) (bool, error) {
 	for {
+		fi, err := os.Stat(path)
+		if err == nil && !fi.Mode().IsRegular() {
+			return false, fmt.Errorf("%s: %w", path, errNotState)
+		}
 		f, err := os.OpenFile(path, os.O_RDWR, 0)
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
@@ -588,13 +610,13 @@ func Reset(path string) (bool, error) {
 			f.Close()
 			continue
 		}
+		// A short read leaves the rest of hdr zero, so it cannot match.
 		var hdr [len(magic)]byte
-		n, err := f.ReadAt(hdr[:], 0)
-		if err != nil && err != io.EOF {
+		if _, err := f.ReadAt(hdr[:], 0); err != nil && err != io.EOF {
 			f.Close()
 			return false, err
 		}
-		if string(hdr[:n]) != magic[:n] {
+		if string(hdr[:]) != magic {
 			f.Close()
 			return false, fmt.Errorf("%s: %w", path, errNotState)
 		}

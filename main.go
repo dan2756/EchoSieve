@@ -28,8 +28,9 @@ State:
       --file PATH          use the state file at PATH instead of a named state
       --ttl DURATION       forget lines first seen longer ago than this,
                            e.g. 12h, 7d, 2w (default: remember forever)
-      --exact              store whole keys instead of 64-bit hashes, ruling
-                           out collisions at the cost of space (new state only)
+      --exact              store whole keys (up to 16 MiB) instead of 64-bit
+                           hashes, ruling out collisions at the cost of space
+                           (new state only)
 
 Keys (what counts as "the same line"):
       --key REGEX          compare only the first capture group of REGEX, or
@@ -129,7 +130,10 @@ func (a *app) run(args []string) int {
 		return a.usageError(fmt.Sprintf("unexpected argument %q (input is read from stdin)", fs.Arg(0)))
 	}
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "d" || f.Name == "delimiter" {
+		switch f.Name {
+		case "f", "field":
+			keyOpts.fieldSet = true
+		case "d", "delimiter":
 			keyOpts.delimSet = true
 		}
 	})
@@ -211,12 +215,21 @@ func (a *app) filterLine(st *Store, key, line []byte, invert bool) error {
 		_, err := a.stdout.Write(line)
 		return err
 	}
-	if !invert {
-		_, err := st.Seen(key, write)
-		return err
+	onNew := write
+	if invert {
+		onNew = nil
 	}
-	seen, err := st.Seen(key, nil)
-	if err != nil || !seen {
+	seen, err := st.Seen(key, onNew)
+	switch {
+	case errors.Is(err, errKeyTooLong):
+		// Such a key can never be recorded, so the line is new every
+		// time. Say so, but keep the stream going.
+		fmt.Fprintf(a.stderr, "dedupe-stream: %v; treating the line as new without recording it\n", err)
+		if invert {
+			return nil
+		}
+		return write()
+	case err != nil || !invert || !seen:
 		return err
 	}
 	return write()

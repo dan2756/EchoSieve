@@ -117,6 +117,8 @@ func TestUsageErrors(t *testing.T) {
 		{"--key", "x", "-f", "2"},
 		{"-d", ","},
 		{"-f", "0", "-d", ""},
+		{"-f", "0"},
+		{"--field", "0", "-d", ","},
 		{"--field", "abc"},
 	} {
 		if _, _, code := runApp(t, env, "", args...); code != exitUsage {
@@ -161,6 +163,27 @@ func TestFieldFlagEndToEnd(t *testing.T) {
 	out, _, _ := runApp(t, nil, in, "--file", file, "-f", "2", "-d", ",")
 	if want := "1,alice,login\n2,bob,login\n"; out != want {
 		t.Errorf("output = %q, want %q", out, want)
+	}
+}
+
+func TestExactKeyTooLongPassesThrough(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "x.seen")
+	long := strings.Repeat("x", maxExactKey+1) + "\n"
+	in := long + "small\n" + long + "small\n"
+	out, errOut, code := runApp(t, nil, in, "--file", file, "--exact")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	// The long line cannot be recorded, so it passes every time, and the
+	// stream goes on past it.
+	if want := long + "small\n" + long; out != want {
+		t.Errorf("got %d bytes of output, want %d", len(out), len(want))
+	}
+	if !strings.Contains(errOut, "too long") {
+		t.Errorf("no warning on stderr: %q", errOut)
+	}
+	if got, want := fileSize(t, file), int64(headerSize+exactRecHead+len("small")); got != want {
+		t.Errorf("state size = %d, want %d", got, want)
 	}
 }
 
