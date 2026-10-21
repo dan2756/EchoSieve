@@ -576,6 +576,53 @@ func TestReadOnlyKeepsKeysAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestLongKeyAfterAdoptingExactFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	stale := mustOpen(t, path)
+	seen(t, stale, "short")
+
+	existed, err := Reset(path)
+	if err != nil || !existed {
+		t.Fatalf("Reset = %v, %v", existed, err)
+	}
+	exact := openWith(t, path, Options{Exact: true, Now: fixedClock(testNow)})
+	seen(t, exact, "kept")
+	exact.Close()
+
+	// stale still has the old hash file open. The next new key has to
+	// adopt the exact file and then honor its size limit: writing the
+	// oversized key would make every later reader reject the file.
+	huge := bytes.Repeat([]byte("x"), maxExactKey+1)
+	called := false
+	_, err = stale.Seen(huge, func() error { called = true; return nil })
+	if !errors.Is(err, errKeyTooLong) {
+		t.Fatalf("err = %v, want %v", err, errKeyTooLong)
+	}
+	if called {
+		t.Error("onNew called for an oversized key")
+	}
+	if got, want := fileSize(t, path), int64(headerSize+exactRecHead+len("kept")); got != want {
+		t.Errorf("size = %d, want %d", got, want)
+	}
+	if seen(t, stale, "after") {
+		t.Fatal("after seen on first sight")
+	}
+
+	again := openWith(t, path, Options{Exact: true, Now: fixedClock(testNow)})
+	for _, k := range []string{"kept", "after"} {
+		if !seen(t, again, k) {
+			t.Errorf("%q lost", k)
+		}
+	}
+	st, err := again.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Exact || st.Entries != 2 {
+		t.Errorf("stats = %+v, want exact with 2 entries", st)
+	}
+}
+
 func TestExactStoreRejectsLongKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.seen")
 	s := openWith(t, path, Options{Exact: true, Now: fixedClock(testNow)})

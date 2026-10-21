@@ -393,8 +393,14 @@ func (s *Store) Seen(key []byte, onNew func() error) (bool, error) {
 	if s.has(key) {
 		return true, nil
 	}
-	if s.kind == kindExact && len(key) > maxExactKey {
-		return false, fmt.Errorf("%w (%d bytes, limit %d)", errKeyTooLong, len(key), maxExactKey)
+	// An exact file cannot store this key. Skip the lock when the open
+	// file is still the one at path: its kind cannot have changed, and a
+	// key this long is new every time. If another process replaced the
+	// file, fall through so refresh can adopt the new kind first. Checking
+	// only the kind remembered from startup would let a hash-mode store
+	// append an oversized exact record, which later readers reject.
+	if err := s.keyTooLong(key); err != nil && sameFile(s.f, s.path) {
+		return false, err
 	}
 	seen := false
 	err := s.locked(func() error {
@@ -404,6 +410,9 @@ func (s *Store) Seen(key []byte, onNew func() error) (bool, error) {
 		if s.has(key) {
 			seen = true
 			return nil
+		}
+		if err := s.keyTooLong(key); err != nil {
+			return err
 		}
 		if onNew != nil {
 			if err := onNew(); err != nil {
@@ -415,7 +424,19 @@ func (s *Store) Seen(key []byte, onNew func() error) (bool, error) {
 	return seen, err
 }
 
+// keyTooLong reports whether key exceeds the exact-record limit for the
+// kind this store would write now.
+func (s *Store) keyTooLong(key []byte) error {
+	if s.kind != kindExact || len(key) <= maxExactKey {
+		return nil
+	}
+	return fmt.Errorf("%w (%d bytes, limit %d)", errKeyTooLong, len(key), maxExactKey)
+}
+
 func (s *Store) add(key []byte, ts int64) error {
+	if err := s.keyTooLong(key); err != nil {
+		return err
+	}
 	var h uint64
 	if s.kind == kindHash {
 		h = hashKey(key)
