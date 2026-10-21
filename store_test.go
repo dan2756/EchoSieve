@@ -147,6 +147,74 @@ func TestTTLCompactsOnStartup(t *testing.T) {
 	}
 }
 
+func TestTTLDoesNotExpireEarly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	// Recorded near the end of a unix second. The stored timestamp is that
+	// second, and a 1s TTL must not treat the key as already expired.
+	c := &clock{t: testNow.Add(900 * time.Millisecond)}
+	s := openWith(t, path, c.opts(time.Second))
+	if seen(t, s, "x") {
+		t.Fatal("x seen on first sight")
+	}
+	c.advance(200 * time.Millisecond)
+	if !seen(t, s, "x") {
+		t.Fatal("x forgotten after 200ms with a 1s TTL")
+	}
+	if got, want := fileSize(t, path), int64(headerSize+hashRecSize); got != want {
+		t.Errorf("size = %d, want %d (key was recorded twice)", got, want)
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Entries != 1 || st.Expired != 0 {
+		t.Errorf("entries/expired = %d/%d, want 1/0", st.Entries, st.Expired)
+	}
+}
+
+func TestTTLExactBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	c := &clock{t: testNow}
+	s := openWith(t, path, c.opts(time.Hour))
+	if seen(t, s, "x") {
+		t.Fatal("x seen on first sight")
+	}
+
+	// Exactly one TTL later the key is not yet older than the TTL.
+	c.advance(time.Hour)
+	if !seen(t, s, "x") {
+		t.Fatal("x forgotten at exactly its TTL")
+	}
+	s.Close()
+
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = openWith(t, path, c.opts(time.Hour))
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Error("file rewritten although the key is exactly TTL old")
+	}
+	if !seen(t, s, "x") {
+		t.Error("x forgotten by reopen at exactly its TTL")
+	}
+	s.Close()
+
+	// One second past the TTL it expires, and compaction drops it.
+	c.advance(time.Second)
+	s = openWith(t, path, c.opts(time.Hour))
+	if got, want := fileSize(t, path), int64(headerSize); got != want {
+		t.Errorf("size after compaction = %d, want %d", got, want)
+	}
+	if seen(t, s, "x") {
+		t.Error("x still remembered after its TTL")
+	}
+}
+
 func TestTTLExpiresWhileRunning(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.seen")
 	c := &clock{t: testNow}

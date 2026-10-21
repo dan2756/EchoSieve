@@ -348,7 +348,11 @@ func (s *Store) times() iter.Seq[int64] {
 	return maps.Values(s.hashes)
 }
 
-// cutoff returns the unix time at or before which entries have expired.
+// cutoff returns the earliest recorded unix second that is still inside
+// the TTL. A key is dropped only when it is strictly older than that, so
+// one first seen exactly TTL ago is still kept. Timestamps are whole
+// seconds, which means a key recorded late in its second is not treated
+// as already a second old.
 func (s *Store) cutoff() int64 {
 	if s.opts.TTL <= 0 {
 		return math.MinInt64
@@ -364,14 +368,14 @@ func (s *Store) has(key []byte) bool {
 	} else {
 		ts, ok = s.hashes[hashKey(key)]
 	}
-	return ok && ts > s.cutoff()
+	return ok && ts >= s.cutoff()
 }
 
 // live counts the keys that have not expired.
 func (s *Store) live() int {
 	cutoff, n := s.cutoff(), 0
 	for ts := range s.times() {
-		if ts > cutoff {
+		if ts >= cutoff {
 			n++
 		}
 	}
@@ -459,14 +463,14 @@ func (s *Store) compact() error {
 	cutoff := s.cutoff()
 	keep := make([]entry, 0, s.Len())
 	for h, ts := range s.hashes {
-		if ts > cutoff {
+		if ts >= cutoff {
 			keep = append(keep, entry{ts: ts, h: h})
 		} else {
 			delete(s.hashes, h)
 		}
 	}
 	for key, ts := range s.exact {
-		if ts > cutoff {
+		if ts >= cutoff {
 			keep = append(keep, entry{ts: ts, key: key})
 		} else {
 			delete(s.exact, key)
@@ -558,7 +562,7 @@ func (s *Store) Stats() (Stats, error) {
 	cutoff := s.cutoff()
 	var oldest, newest int64
 	for ts := range s.times() {
-		if ts <= cutoff {
+		if ts < cutoff {
 			st.Expired++
 			continue
 		}
