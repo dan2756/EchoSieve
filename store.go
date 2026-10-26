@@ -122,6 +122,10 @@ func OpenStore(path string, opts Options) (*Store, error) {
 // A read-only store keeps its index instead: the keys it would have
 // recorded exist only in memory, and forgetting them would let a line
 // pass twice in one run.
+//
+// A path that does not exist yet is created. An existing file is only
+// opened: an empty file or anything that is not a regular file is left
+// untouched and reported as not a state file, same as --reset.
 func (s *Store) open() error {
 	if s.f != nil {
 		s.f.Close()
@@ -135,16 +139,74 @@ func (s *Store) open() error {
 		}
 	}
 
-	var err error
-	if s.opts.ReadOnly {
-		s.f, err = os.Open(s.path)
-		if errors.Is(err, os.ErrNotExist) {
+	fi, err := os.Stat(s.path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if s.opts.ReadOnly {
 			return nil
 		}
-	} else {
-		s.f, err = os.OpenFile(s.path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+		// EEXIST means another process published the file first; open that one.
+		if err := createNewState(s.path, s.kind); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+	case err != nil:
+		return err
+	default:
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s: %w", s.path, errNotState)
+		}
 	}
-	return err
+
+	flag := os.O_RDONLY
+	if !s.opts.ReadOnly {
+		flag = os.O_RDWR | os.O_APPEND
+	}
+	f, err := os.OpenFile(s.path, flag, 0)
+	if errors.Is(err, os.ErrNotExist) && s.opts.ReadOnly {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// Stat followed the path before open. Recheck the descriptor so a
+	// replacement with a device between the two calls is still refused.
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() {
+		f.Close()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%s: %w", s.path, errNotState)
+	}
+	s.f = f
+	return nil
+}
+
+// createNewState publishes a new state file at path. The header is written
+// to a temporary file in the same directory and linked into place, so path
+// never exists as an empty file a later open could mistake for a log.
+func createNewState(path string, kind byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".ds-creating-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName)
+	}()
+	if _, err := tmp.Write(header(kind)); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := os.Link(tmpName, path); err != nil {
+		return err
+	}
+	syncDir(dir)
+	return nil
 }
 
 // setKind switches the record kind and empties the in-memory index.
@@ -213,16 +275,10 @@ func (s *Store) refresh() error {
 	}
 	size := fi.Size()
 	if s.off == 0 {
-		switch {
-		case size == 0 && s.opts.ReadOnly:
-			return nil
-		case size == 0:
-			if _, err := s.f.Write(header(s.kind)); err != nil {
-				return err
-			}
-			s.off = headerSize
-			return nil
-		case size < headerSize:
+		// Shorter than a header means this is not a state file. New files
+		// are published with a finished header, so writing one here would
+		// overwrite a foreign empty file such as a rotated log.
+		if size < headerSize {
 			return errNotState
 		}
 		if err := s.readHeader(); err != nil {

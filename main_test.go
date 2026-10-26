@@ -316,6 +316,28 @@ func TestResetFlag(t *testing.T) {
 	}
 }
 
+func TestEmptyFileIsNotAdopted(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(log, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, errOut, code := runApp(t, nil, "hello\n", "--file", log)
+	if code != exitError || !strings.Contains(errOut, "not a dedupe-stream state file") {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty log was modified: %q", got)
+	}
+	out, errOut, code := runApp(t, nil, "hello\n", "--file", log, "--dry-run")
+	if code != exitError || out != "" || !strings.Contains(errOut, "not a dedupe-stream state file") {
+		t.Fatalf("dry-run: exit %d, stdout %q, stderr %q", code, out, errOut)
+	}
+}
+
 func TestActionConflicts(t *testing.T) {
 	env := map[string]string{"HOME": t.TempDir()}
 	for _, args := range [][]string{
