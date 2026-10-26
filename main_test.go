@@ -371,6 +371,25 @@ func TestReadErrorDoesNotRecordPartialLine(t *testing.T) {
 	}
 }
 
+func TestHumanBytes(t *testing.T) {
+	for n, want := range map[int64]string{
+		0:                  "0 B",
+		1023:               "1023 B",
+		1024:               "1.0 KiB",
+		1536:               "1.5 KiB",
+		64:                 "64 B",
+		1048515:            "1023.9 KiB", // just below the rounding boundary
+		1024*1024 - 1:      "1.0 MiB",    // used to render as "1024.0 KiB"
+		1024 * 1024:        "1.0 MiB",
+		1024*1024*1024 - 1: "1.0 GiB",
+		1024 * 1024 * 1024: "1.0 GiB",
+	} {
+		if got := humanBytes(n); got != want {
+			t.Errorf("humanBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
 func TestEmptyFileIsNotAdopted(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "app.log")
 	if err := os.WriteFile(log, nil, 0o644); err != nil {
