@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -104,6 +106,126 @@ func TestStoreRejectsForeignFile(t *testing.T) {
 	}
 	if _, err := OpenStore(path, Options{}); !errors.Is(err, errNotState) {
 		t.Fatalf("err = %v, want %v", err, errNotState)
+	}
+}
+
+func TestOpenLeavesEmptyAndSpecialFilesUntouched(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty.log")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "subdir")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "devnull")
+	if err := os.Symlink(os.DevNull, link); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{empty, sub, fifo, link} {
+		done := make(chan error, 1)
+		go func() {
+			_, err := OpenStore(path, Options{Now: fixedClock(testNow)})
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if !errors.Is(err, errNotState) {
+				t.Errorf("%s: err = %v, want %v", path, err, errNotState)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: OpenStore blocked", path)
+		}
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("%s: %v", path, err)
+		}
+	}
+	if got, err := os.ReadFile(empty); err != nil || len(got) != 0 {
+		t.Errorf("empty log = %q, %v; want it untouched", got, err)
+	}
+
+	// A missing path is still created, with a finished header and no temp file.
+	fresh := filepath.Join(dir, "new.seen")
+	s := openWith(t, fresh, Options{Exact: true, Now: fixedClock(testNow)})
+	if seen(t, s, "a") {
+		t.Fatal("a seen on first sight")
+	}
+	s.Close()
+	data, err := os.ReadFile(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < headerSize || string(data[:len(magic)]) != magic || data[9] != kindExact {
+		t.Fatalf("new file does not start with an exact header: %x", data)
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if len(e.Name()) >= len(".ds-creating-") && e.Name()[:len(".ds-creating-")] == ".ds-creating-" {
+			t.Errorf("creation temp file left behind: %s", e.Name())
+		}
+	}
+
+	// A header-only file (everything expired and compacted) still opens.
+	c := &clock{t: testNow}
+	aged := filepath.Join(dir, "aged.seen")
+	s = openWith(t, aged, c.opts(time.Hour))
+	seen(t, s, "old")
+	s.Close()
+	c.advance(2 * time.Hour)
+	s = openWith(t, aged, c.opts(time.Hour))
+	s.Close()
+	if got, want := fileSize(t, aged), int64(headerSize); got != want {
+		t.Fatalf("size after compaction = %d, want %d", got, want)
+	}
+	s = openWith(t, aged, c.opts(time.Hour))
+	if seen(t, s, "old") {
+		t.Error("expired key came back from a header-only file")
+	}
+}
+
+func TestConcurrentCreateSharesOneFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.seen")
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s, err := OpenStore(path, Options{Now: fixedClock(testNow)})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer s.Close()
+			if _, err := s.Seen([]byte("shared"), nil); err != nil {
+				errCh <- err
+			}
+			if _, err := s.Seen([]byte{'k', byte('a' + i)}, nil); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	s := mustOpen(t, path)
+	if !seen(t, s, "shared") {
+		t.Fatal("shared key missing")
+	}
+	// One record for "shared", plus one per goroutine.
+	if got, want := fileSize(t, path), int64(headerSize+9*hashRecSize); got != want {
+		t.Errorf("size = %d, want %d", got, want)
 	}
 }
 
