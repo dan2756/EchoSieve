@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -313,6 +315,59 @@ func TestResetFlag(t *testing.T) {
 	}
 	if _, err := os.Stat(log); err != nil {
 		t.Error("--reset deleted a foreign file")
+	}
+}
+
+// chunkReader returns each chunk from its own Read, then a final error.
+type chunkReader struct {
+	chunks [][]byte
+	err    error
+	i      int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if r.i < len(r.chunks) {
+		n := copy(p, r.chunks[r.i])
+		r.i++
+		return n, nil
+	}
+	if r.err != nil {
+		err := r.err
+		r.err = nil
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func TestReadErrorDoesNotRecordPartialLine(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "x.seen")
+	readErr := errors.New("disk read failed")
+	var out, errOut bytes.Buffer
+	a := &app{
+		stdin: &chunkReader{
+			chunks: [][]byte{[]byte("keep\npartial")},
+			err:    readErr,
+		},
+		stdout: &out,
+		stderr: &errOut,
+		getenv: func(string) string { return "" },
+		now:    func() time.Time { return testNow },
+	}
+	code := a.run([]string{"--file", file})
+	if code != exitError || !strings.Contains(errOut.String(), readErr.Error()) {
+		t.Fatalf("exit %d, stderr %q", code, errOut.String())
+	}
+	if got := out.String(); got != "keep\n" {
+		t.Errorf("stdout = %q, want %q", got, "keep\n")
+	}
+
+	// The torn prefix was not recorded, so both it and a new line pass.
+	out2, errOut2, code := runApp(t, nil, "partial\nhello\n", "--file", file)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut2)
+	}
+	if out2 != "partial\nhello\n" {
+		t.Errorf("after read error, output = %q, want %q", out2, "partial\nhello\n")
 	}
 }
 

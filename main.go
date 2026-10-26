@@ -192,7 +192,9 @@ func (a *app) filter(st *Store, keys *keyer, invert bool) error {
 	for {
 		line, err := readLine(r, buf[:0])
 		buf = line
-		if len(line) > 0 {
+		// A non-EOF read error leaves a partial line. Recording it would
+		// suppress that prefix later, so drop it and surface the error.
+		if len(line) > 0 && (err == nil || err == io.EOF) {
 			if line[len(line)-1] != '\n' {
 				line = append(line, '\n') // unterminated last line
 				buf = line
