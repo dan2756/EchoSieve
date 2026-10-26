@@ -135,12 +135,18 @@ func humanBytes(n int64) string {
 	if n < 1024 {
 		return fmt.Sprintf("%d B", n)
 	}
-	v, unit := float64(n)/1024, "KiB"
-	for _, u := range []string{"MiB", "GiB", "TiB"} {
-		if v < 1024 {
-			break
-		}
-		v, unit = v/1024, u
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	v := float64(n)
+	i := -1
+	for i+1 < len(units) && v >= 1024 {
+		v /= 1024
+		i++
 	}
-	return fmt.Sprintf("%.1f %s", v, unit)
+	// %.1f rounds 1023.95 up to "1024.0". Carry into the next unit so a
+	// size just under 1 MiB is not shown as 1024.0 KiB.
+	if i+1 < len(units) && fmt.Sprintf("%.1f", v) == "1024.0" {
+		v /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }
