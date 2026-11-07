@@ -64,6 +64,40 @@ func TestNamedStateUsesXDGStateHome(t *testing.T) {
 	}
 }
 
+func TestRelativeHomeIsIgnored(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(wd) })
+
+	_, errOut, code := runApp(t, map[string]string{"HOME": "relhome"}, "a\n")
+	if code != exitUsage || !strings.Contains(errOut, "HOME") {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 0 {
+		t.Errorf("relative HOME created files in the working directory: %v", ents)
+	}
+
+	// An absolute XDG_STATE_HOME still wins when HOME is relative.
+	xdg := t.TempDir()
+	env := map[string]string{"HOME": "relhome", "XDG_STATE_HOME": xdg}
+	if _, errOut, code := runApp(t, env, "a\n", "--name", "web"); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if _, err := os.Stat(filepath.Join(xdg, "dedupe-stream", "web.seen")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDefaultStateUnderHome(t *testing.T) {
 	home := t.TempDir()
 	// A relative XDG_STATE_HOME is ignored, per the XDG spec.

@@ -93,6 +93,10 @@ func OpenStore(path string, opts Options) (*Store, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	path, _, err := followSymlink(path)
+	if err != nil {
+		return nil, err
+	}
 	s := &Store{path: path, opts: opts}
 	if !opts.ReadOnly {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -102,7 +106,7 @@ func OpenStore(path string, opts Options) (*Store, error) {
 	if err := s.open(); err != nil {
 		return nil, err
 	}
-	err := s.locked(func() error {
+	err = s.locked(func() error {
 		if err := s.refresh(); err != nil {
 			return err
 		}
@@ -670,7 +674,23 @@ func (s *Store) Close() error {
 // another process's append, and it refuses to delete anything that is not
 // a state file: a device or FIFO is not even opened, and a regular file
 // (an empty one included) must start with the magic.
+//
+// A symlink is followed. rename and remove do not follow a final symlink,
+// so deleting or compacting the link itself would leave the state file,
+// and any --exact lines in it, under the target name.
 func Reset(path string) (bool, error) {
+	link := ""
+	resolved, viaLink, err := followSymlink(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if viaLink {
+		link = path
+		path = resolved
+	}
 	for {
 		fi, err := os.Stat(path)
 		if err == nil && !fi.Mode().IsRegular() {
@@ -704,8 +724,40 @@ func Reset(path string) (bool, error) {
 		err = os.Remove(path)
 		os.Remove(path + ".compact")
 		f.Close()
-		return err == nil, err
+		if err != nil {
+			return false, err
+		}
+		if link != "" {
+			if err := os.Remove(link); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return true, err
+			}
+		}
+		return true, nil
 	}
+}
+
+// followSymlink resolves path when its final element is a symlink.
+// Open follows a symlink, but rename and remove do not, so compaction
+// and --reset have to use the target path or they edit the link instead
+// of the state file. A missing path is returned unchanged so a new file
+// can be created there. A dangling symlink is reported with the error
+// from resolving it, which is os.ErrNotExist.
+func followSymlink(path string) (resolved string, viaLink bool, err error) {
+	st, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if st.Mode()&os.ModeSymlink == 0 {
+		return path, false, nil
+	}
+	resolved, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", true, err
+	}
+	return resolved, true, nil
 }
 
 // hashKey returns the first 8 bytes of SHA-256(key). With n keys stored, the

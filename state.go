@@ -18,8 +18,11 @@ func stateDir(getenv func(string) string) (string, error) {
 	if d := getenv("XDG_STATE_HOME"); d != "" && filepath.IsAbs(d) {
 		return filepath.Join(d, "dedupe-stream"), nil
 	}
+	// HOME is not an XDG variable, but a relative value would place the
+	// state directory under the working directory the process happened
+	// to start in.
 	home := getenv("HOME")
-	if home == "" {
+	if home == "" || !filepath.IsAbs(home) {
 		return "", errors.New("cannot find a state directory: set HOME or XDG_STATE_HOME, or use --file")
 	}
 	return filepath.Join(home, ".local", "state", "dedupe-stream"), nil
