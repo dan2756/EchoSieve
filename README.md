@@ -151,11 +151,14 @@ dedupe-stream: removed /home/dj/.local/state/dedupe-stream/app-errors.seen
 
 `--reset` refuses to delete a file that is not a dedupe-stream state file (an
 empty file or a device such as `/dev/null` included), so a mistyped
-`--file app.log --reset` is harmless. A normal run makes the same check
-before it writes anything: an existing empty file, or a file that is not a
-regular file, is left untouched and reported as not a state file. A new
-state file is published by linking a finished header into place, so it never
-shows up as an empty file the next run could confuse with a log.
+`--file app.log --reset` is harmless. A symlink is followed: compaction
+rewrites the file it points at, and `--reset` removes that file and the
+link, so the old keys are not left behind under the target name. A normal
+run makes the same check before it writes anything: an existing empty file,
+or a file that is not a regular file, is left untouched and reported as not
+a state file. A new state file is published by linking a finished header
+into place, so it never shows up as an empty file the next run could
+confuse with a log.
 
 ## Running several at once
 

@@ -472,6 +472,92 @@ func TestReset(t *testing.T) {
 	}
 }
 
+func TestSymlinkIsFollowed(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.seen")
+	link := filepath.Join(dir, "link.seen")
+	if err := os.Symlink(filepath.Base(real), link); err != nil {
+		t.Fatal(err)
+	}
+
+	// A dangling link is not a place to publish a new state file.
+	if _, err := OpenStore(link, Options{Now: fixedClock(testNow)}); err == nil {
+		t.Fatal("opened a dangling symlink")
+	}
+	if st, err := os.Lstat(link); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("dangling symlink was replaced: %v", err)
+	}
+	existed, err := Reset(link)
+	if err != nil || existed {
+		t.Fatalf("Reset(dangling) = %v, %v; want false, nil", existed, err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatal(err)
+	}
+
+	// A link to an ordinary file is left alone, link included.
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(logPath, []byte("keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(logPath), link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenStore(link, Options{Now: fixedClock(testNow)}); !errors.Is(err, errNotState) {
+		t.Fatalf("open log through link: %v", err)
+	}
+	if _, err := Reset(link); !errors.Is(err, errNotState) {
+		t.Fatalf("reset log through link: %v", err)
+	}
+	if st, err := os.Lstat(link); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link to a log was replaced: %v", err)
+	}
+	if got, err := os.ReadFile(logPath); err != nil || string(got) != "keep me\n" {
+		t.Fatalf("log = %q, %v", got, err)
+	}
+
+	// Point the link at a real state file. Compaction must rewrite that
+	// file and leave the link in place.
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	c := &clock{t: testNow}
+	s := openWith(t, real, c.opts(0))
+	seen(t, s, "old")
+	s.Close()
+	if err := os.Symlink(filepath.Base(real), link); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(10 * day)
+	s = openWith(t, link, c.opts(7*day))
+	s.Close()
+	if st, err := os.Lstat(link); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("compaction replaced the symlink: %v", err)
+	}
+	if got, want := fileSize(t, real), int64(headerSize); got != want {
+		t.Errorf("target size after compaction = %d, want %d", got, want)
+	}
+	again := openWith(t, real, c.opts(0))
+	if seen(t, again, "old") {
+		t.Error("expired key still stored in the target")
+	}
+	again.Close()
+
+	existed, err = Reset(link)
+	if err != nil || !existed {
+		t.Fatalf("Reset(link) = %v, %v; want true, nil", existed, err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Errorf("symlink still present: %v", err)
+	}
+	if _, err := os.Stat(real); !os.IsNotExist(err) {
+		t.Errorf("target state file still present: %v", err)
+	}
+}
+
 func TestResetRefusesForeignFile(t *testing.T) {
 	dir := t.TempDir()
 	for name, data := range map[string]string{
