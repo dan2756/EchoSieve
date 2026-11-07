@@ -209,7 +209,7 @@ place, so the state is never half-rewritten.
 | Variable | Meaning |
 | --- | --- |
 | `XDG_STATE_HOME` | base directory for named states; must be absolute, as the XDG spec requires (relative values are ignored) |
-| `HOME` | used for the default `~/.local/state` when `XDG_STATE_HOME` is unset |
+| `HOME` | used for the default `~/.local/state` when `XDG_STATE_HOME` is unset or not absolute; a relative value is ignored |
 
 `--file` bypasses both.
 
